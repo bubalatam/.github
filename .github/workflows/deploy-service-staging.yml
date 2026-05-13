@@ -1,0 +1,334 @@
+name: Deploy service to staging (reusable)
+
+# Reusable workflow called by bubalatam/api and bubalatam/web on push to the
+# Staging branch. Builds the service image, pushes to ECR with an immutable
+# `staging-<sha>` tag, then SSM RunCommand on the staging EC2 to update
+# /opt/buba/.env.staging and `docker compose up -d` the service. Polls
+# container health, mirrors deploy metadata to S3 (optional), notifies Slack
+# (optional).
+#
+# Caller required permissions: id-token: write, contents: read.
+# Caller required secrets:     AWS_ROLE_ARN.   Optional: SLACK_WEBHOOK_URL.
+# Caller required vars:        EC2_INSTANCE_ID_STAGING.   Optional: DEPLOY_BUCKET.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service short name (api | web). Drives ECR repo, compose service, container name, and env-var by convention."
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to the Dockerfile in the caller's repo."
+        required: true
+        type: string
+      build-context:
+        description: "Docker build context (defaults to caller repo root)."
+        required: false
+        type: string
+        default: "."
+      build-args:
+        description: "Newline-separated --build-arg KEY=VALUE pairs."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        required: false
+        type: string
+        default: "us-east-2"
+      ecr-registry:
+        required: false
+        type: string
+        default: "947072750565.dkr.ecr.us-east-2.amazonaws.com"
+      secrets-manager-arn:
+        description: "Optional AWS Secrets Manager secret name or ARN. If set, the EC2 instance role fetches the JSON value, renders KEY=VALUE lines into /opt/buba/.env.staging.secrets (root:root 600), and compose loads it as a second --env-file. EC2 instance role must allow secretsmanager:GetSecretValue on this ARN."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
+
+concurrency:
+  group: deploy-staging-${{ inputs.service }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    name: Build & push ${{ inputs.service }} image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+    steps:
+      - name: Checkout caller
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build & push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: ${{ inputs.build-args }}
+          # ECR repo is IMMUTABLE — only the SHA-pinned tag, no staging-latest
+          # and no registry-mode buildcache. Layer cache uses GitHub Actions
+          # cache (free, separate from ECR).
+          tags: ${{ inputs.ecr-registry }}/buba/${{ inputs.service }}:staging-${{ github.sha }}
+          cache-from: type=gha,scope=staging-${{ inputs.service }}
+          cache-to: type=gha,scope=staging-${{ inputs.service }},mode=max
+
+      - name: Expose image URI
+        id: image
+        env:
+          REGISTRY: ${{ inputs.ecr-registry }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          URI="${REGISTRY}/buba/${SERVICE}:staging-${GITHUB_SHA}"
+          echo "uri=${URI}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${SERVICE} image"
+            echo "\`${URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy ${{ inputs.service }} via SSM
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    timeout-minutes: 20
+    environment: staging
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Validate environment
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
+        run: |
+          if [ -z "${INSTANCE_ID:-}" ]; then
+            echo "::error::vars.EC2_INSTANCE_ID_STAGING is not set on the caller repo"
+            exit 1
+          fi
+
+      - name: Update .env.staging and redeploy
+        id: deploy
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ECR_REGISTRY: ${{ inputs.ecr-registry }}
+          SERVICE: ${{ inputs.service }}
+          SECRETS_ARN: ${{ inputs.secrets-manager-arn }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ENV_VAR=$(printf '%s_IMAGE' "$SERVICE" | tr '[:lower:]' '[:upper:]')   # API_IMAGE | WEB_IMAGE
+          COMPOSE_SERVICE="staging-${SERVICE}"
+          echo "Deploying ${IMAGE_URI} (${ENV_VAR}) to ${INSTANCE_ID}"
+
+          # Build the remote shell script as a single string, then JSON-encode
+          # via jq. Cleaner than escaping double quotes inline. The
+          # ${SECRETS_ARN}-empty branch keeps the workflow backwards-compatible
+          # for callers that don't use Secrets Manager (e.g. web).
+          SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          ENV_FILE=/opt/buba/.env.staging
+          ENV_SECRETS=/opt/buba/.env.staging.secrets
+          COMPOSE_FILE=/opt/buba/docker-compose.staging.server.yml
+          SECRETS_ARN="${SECRETS_ARN}"
+          test -f "\$ENV_FILE" || { echo "missing \$ENV_FILE"; exit 1; }
+          test -f "\$COMPOSE_FILE" || { echo "missing \$COMPOSE_FILE"; exit 1; }
+          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+          if [ -n "\$SECRETS_ARN" ]; then
+            command -v jq >/dev/null 2>&1 || { echo "jq required on EC2 host (sudo apt-get install -y jq)"; exit 1; }
+            TMP=\$(mktemp)
+            chmod 600 "\$TMP"
+            aws secretsmanager get-secret-value --secret-id "\$SECRETS_ARN" --region ${AWS_REGION} --query SecretString --output text \
+              | jq -r 'to_entries[] | "\(.key)=\(.value)"' > "\$TMP"
+            sudo chown root:root "\$TMP"
+            sudo mv "\$TMP" "\$ENV_SECRETS"
+            sudo chmod 600 "\$ENV_SECRETS"
+            echo "Fetched \$(wc -l < \$ENV_SECRETS) secrets from \$SECRETS_ARN"
+          fi
+
+          sudo sed -i "s|^${ENV_VAR}=.*|${ENV_VAR}=${IMAGE_URI}|" "\$ENV_FILE"
+          grep "^${ENV_VAR}=" "\$ENV_FILE"
+
+          EXTRA_ENV_ARGS=""
+          [ -f "\$ENV_SECRETS" ] && EXTRA_ENV_ARGS="--env-file \$ENV_SECRETS"
+          cd /opt/buba && sudo docker compose -f "\$COMPOSE_FILE" --env-file "\$ENV_FILE" \$EXTRA_ENV_ARGS pull ${COMPOSE_SERVICE}
+          cd /opt/buba && sudo docker compose -f "\$COMPOSE_FILE" --env-file "\$ENV_FILE" \$EXTRA_ENV_ARGS up -d ${COMPOSE_SERVICE}
+          sudo docker image prune -f --filter "until=72h" || true
+          EOF
+          )
+          PARAMS=$(jq -nc --arg s "$SCRIPT" '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${SERVICE} ${GH_SHA:0:12}" \
+            --timeout-seconds 600 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=${CMD_ID}" >> "$GITHUB_OUTPUT"
+          # First poll often hits InvocationDoesNotExist while SSM registers.
+          sleep 3
+
+          STATUS=Pending
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) echo "deploy ok"; break ;;
+              Failed|Cancelled|TimedOut)
+                echo "deploy $STATUS — fetching logs"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text || true
+                echo "--- stderr ---"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text || true
+                exit 1 ;;
+              *) echo "$i/60 status=$STATUS"; sleep 10 ;;
+            esac
+          done
+
+          if [ "$STATUS" != Success ]; then
+            echo "::error::deploy polling timed out"
+            exit 1
+          fi
+
+      - name: Health check
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          CONTAINER="buba_staging_${SERVICE}"
+          echo "Polling ${CONTAINER} health..."
+
+          SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          for i in \$(seq 1 30); do
+            STATE=\$(sudo docker inspect -f "{{.State.Health.Status}}" ${CONTAINER} 2>/dev/null || echo none)
+            if [ "\$STATE" = healthy ]; then echo HEALTHY; exit 0; fi
+            if [ "\$STATE" = unhealthy ]; then echo UNHEALTHY; sudo docker logs --tail 80 ${CONTAINER}; exit 1; fi
+            echo "\$i/30 health=\$STATE"; sleep 10
+          done
+          echo "health check timeout"; sudo docker logs --tail 120 ${CONTAINER}; exit 1
+          EOF
+          )
+          PARAMS=$(jq -nc --arg s "$SCRIPT" '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 360 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          sleep 3
+
+          for i in $(seq 1 40); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) echo "health ok"; exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                echo "health $STATUS"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text || true
+                exit 1 ;;
+              *) echo "$i/40 status=$STATUS"; sleep 10 ;;
+            esac
+          done
+          echo "::error::health polling timeout"
+          exit 1
+
+      - name: Record deployment
+        if: success()
+        env:
+          BUCKET_NAME: ${{ vars.DEPLOY_BUCKET }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          SERVICE: ${{ inputs.service }}
+          ACTOR: ${{ github.actor }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${BUCKET_NAME:-}" ]; then
+            echo "DEPLOY_BUCKET not set, skipping audit write"
+            exit 0
+          fi
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          SHORT_SHA="${SHA:0:7}"
+          JSON=$(jq -nc \
+            --arg env "staging" \
+            --arg service "$SERVICE" \
+            --arg sha "$SHA" \
+            --arg image "$IMAGE_URI" \
+            --arg version "$SHORT_SHA" \
+            --arg ts "$TIMESTAMP" \
+            --arg actor "$ACTOR" \
+            --arg branch "$BRANCH" \
+            --arg run "$RUN_URL" \
+            '{environment:$env, service:$service, sha:$sha, image:$image, version:$version, timestamp:$ts, actor:$actor, branch:$branch, workflow_run:$run}')
+          echo "$JSON" | aws s3 cp - "s3://${BUCKET_NAME}/deploy-status/staging-${SERVICE}.json"
+          echo "$JSON" | aws s3 cp - "s3://${BUCKET_NAME}/deploy-status/staging-${SERVICE}/history/${TIMESTAMP}.json"
+
+  notify:
+    name: Notify Slack
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy]
+    timeout-minutes: 5
+    if: always()
+    steps:
+      - name: Check Slack webhook
+        id: slack-check
+        env:
+          URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "${URL:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "SLACK_WEBHOOK_URL not set, skipping notification"
+          fi
+
+      - name: Send Slack notification
+        if: steps.slack-check.outputs.enabled == 'true'
+        uses: slackapi/slack-github-action@fcfb566f8b0aab22203f066d80ca1d7e4b5d05b3 # v1
+        with:
+          payload: |
+            {
+              "text": "Staging ${{ inputs.service }} deploy: ${{ needs.deploy.result }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Staging ${{ inputs.service }} deploy*\n*Status:* ${{ needs.deploy.result }}\n*Image:* `${{ needs.build-and-push.outputs.image_uri }}`\n*Branch:* `${{ github.ref_name }}`\n*Actor:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
