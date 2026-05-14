@@ -10,6 +10,14 @@ name: Deploy service to staging (reusable)
 # Caller required permissions: id-token: write, contents: read.
 # Caller required secrets:     AWS_ROLE_ARN.   Optional: SLACK_WEBHOOK_URL.
 # Caller required vars:        EC2_INSTANCE_ID_STAGING.   Optional: DEPLOY_BUCKET.
+#
+# Set `run-migrations: true` to apply EF Core migrations before bringing the
+# container up. The image must contain a self-contained bundle at
+# `/app/efbundle/efbundle` — the API repo bakes it via `dotnet ef migrations
+# bundle` in its Dockerfile. The bundle runs in a one-shot container that
+# shares the network namespace of `buba_staging_db` so it reaches Postgres
+# via localhost. DB credentials are fetched from AWS Secrets Manager
+# (`Buba-Staging-Db-Password`) on the EC2 — never passed via SSM payload.
 
 on:
   workflow_call:
@@ -32,6 +40,11 @@ on:
         required: false
         type: string
         default: ""
+      run-migrations:
+        description: "Run EF Core migrations bundle (image must include /app/efbundle/efbundle). Set true for the API service only."
+        required: false
+        type: boolean
+        default: false
       aws-region:
         required: false
         type: string
@@ -119,6 +132,86 @@ jobs:
         run: |
           if [ -z "${INSTANCE_ID:-}" ]; then
             echo "::error::vars.EC2_INSTANCE_ID_STAGING is not set on the caller repo"
+            exit 1
+          fi
+
+      - name: Run EF Core migrations bundle
+        if: inputs.run-migrations
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ECR_REGISTRY: ${{ inputs.ecr-registry }}
+        run: |
+          set -euo pipefail
+          echo "Applying migrations from ${IMAGE_URI}"
+
+          # Convention: the staging Postgres container is `buba_staging_db`,
+          # the database is `buba_cms_staging`, the user is `buba_admin`, and
+          # the password lives at `Buba-Staging-Db-Password` in Secrets
+          # Manager. We share the db container's network namespace so the
+          # bundle reaches Postgres at localhost:5432 — no need to discover
+          # the compose network name. The DB password never leaves the EC2.
+          SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          aws ecr get-login-password --region ${AWS_REGION} | sudo docker login --username AWS --password-stdin ${ECR_REGISTRY}
+          sudo docker pull ${IMAGE_URI}
+
+          DB_PASSWORD=\$(aws secretsmanager get-secret-value \\
+            --region ${AWS_REGION} \\
+            --secret-id Buba-Staging-Db-Password \\
+            --query SecretString --output text)
+          if [ -z "\$DB_PASSWORD" ]; then
+            echo "ERROR: empty DB password from Secrets Manager"
+            exit 1
+          fi
+
+          if ! sudo docker inspect buba_staging_db >/dev/null 2>&1; then
+            echo "ERROR: buba_staging_db container not running"
+            exit 1
+          fi
+
+          CONN="Host=localhost;Port=5432;Database=buba_cms_staging;Username=buba_admin;Password=\$DB_PASSWORD"
+          sudo docker run --rm \\
+            --network container:buba_staging_db \\
+            --entrypoint /app/efbundle/efbundle \\
+            ${IMAGE_URI} \\
+            --connection "\$CONN"
+          echo "Migrations applied."
+          EOF
+          )
+          PARAMS=$(jq -nc --arg s "$SCRIPT" '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Migrate ${GITHUB_SHA:0:12}" \
+            --timeout-seconds 600 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          sleep 3
+
+          STATUS=Pending
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) echo "migrations ok"; break ;;
+              Failed|Cancelled|TimedOut)
+                echo "migrations $STATUS — fetching logs"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text || true
+                echo "--- stderr ---"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text || true
+                exit 1 ;;
+              *) echo "$i/60 status=$STATUS"; sleep 10 ;;
+            esac
+          done
+
+          if [ "$STATUS" != Success ]; then
+            echo "::error::migration polling timed out"
             exit 1
           fi
 
