@@ -62,7 +62,7 @@ on:
       migration-conn-template:
         required: false
         type: string
-        default: "Host=localhost;Port=5432;Database=buba_cms_staging;Username=buba_admin;Password={password}"
+        default: "Host=localhost;Port=5432;Database=Buba_CMS_Staging;Username=buba_admin;Password={password}"
 
 permissions:
   id-token: write
