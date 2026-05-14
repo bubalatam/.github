@@ -45,6 +45,21 @@ on:
         required: false
         type: boolean
         default: false
+      migration-db-container:
+        description: "Docker container name of the Postgres instance the bundle should connect to. The migration runner shares its network namespace."
+        required: false
+        type: string
+        default: "buba_staging_db"
+      migration-db-password-secret:
+        description: "AWS Secrets Manager secret ID holding the DB password used by the bundle."
+        required: false
+        type: string
+        default: "Buba-Staging-Db-Password"
+      migration-conn-template:
+        description: "Postgres connection string template for the bundle. Must contain `{password}` — replaced at runtime with the value of `migration-db-password-secret`. Host is always `localhost` because the migration runner is in the db container's network namespace."
+        required: false
+        type: string
+        default: "Host=localhost;Port=5432;Database=buba_cms_staging;Username=buba_admin;Password={password}"
       aws-region:
         required: false
         type: string
@@ -142,16 +157,20 @@ jobs:
           IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
           AWS_REGION: ${{ inputs.aws-region }}
           ECR_REGISTRY: ${{ inputs.ecr-registry }}
+          DB_CONTAINER: ${{ inputs.migration-db-container }}
+          DB_SECRET_ID: ${{ inputs.migration-db-password-secret }}
+          CONN_TEMPLATE: ${{ inputs.migration-conn-template }}
         run: |
           set -euo pipefail
-          echo "Applying migrations from ${IMAGE_URI}"
+          echo "Applying migrations from ${IMAGE_URI} (db=${DB_CONTAINER}, secret=${DB_SECRET_ID})"
 
-          # Convention: the staging Postgres container is `buba_staging_db`,
-          # the database is `buba_cms_staging`, the user is `buba_admin`, and
-          # the password lives at `Buba-Staging-Db-Password` in Secrets
-          # Manager. We share the db container's network namespace so the
-          # bundle reaches Postgres at localhost:5432 — no need to discover
-          # the compose network name. The DB password never leaves the EC2.
+          # The bundle runs in a one-shot container sharing the db container's
+          # network namespace so it reaches Postgres at localhost. We resolve
+          # the DB password from AWS Secrets Manager on the EC2 (never via SSM
+          # payload), substitute it into the connection template, then pass
+          # the result both as CONNECTIONSTRINGS__DATABASE env var (required
+          # by DatabaseContextFactory at design time) and as --connection arg
+          # to the bundle. Matches the old S3+tar.gz deploy script pattern.
           SCRIPT=$(cat <<EOF
           set -euo pipefail
           aws ecr get-login-password --region ${AWS_REGION} | sudo docker login --username AWS --password-stdin ${ECR_REGISTRY}
@@ -159,21 +178,25 @@ jobs:
 
           DB_PASSWORD=\$(aws secretsmanager get-secret-value \\
             --region ${AWS_REGION} \\
-            --secret-id Buba-Staging-Db-Password \\
+            --secret-id ${DB_SECRET_ID} \\
             --query SecretString --output text)
           if [ -z "\$DB_PASSWORD" ]; then
-            echo "ERROR: empty DB password from Secrets Manager"
+            echo "ERROR: empty DB password from Secrets Manager (${DB_SECRET_ID})"
             exit 1
           fi
 
-          if ! sudo docker inspect buba_staging_db >/dev/null 2>&1; then
-            echo "ERROR: buba_staging_db container not running"
+          if ! sudo docker inspect ${DB_CONTAINER} >/dev/null 2>&1; then
+            echo "ERROR: ${DB_CONTAINER} container not running"
             exit 1
           fi
 
-          CONN="Host=localhost;Port=5432;Database=buba_cms_staging;Username=buba_admin;Password=\$DB_PASSWORD"
+          # Substitute {password} placeholder in the template. CONN_TEMPLATE is
+          # expanded by the runner (heredoc), DB_PASSWORD by the EC2 (escaped).
+          CONN="${CONN_TEMPLATE//\{password\}/\$DB_PASSWORD}"
+
           sudo docker run --rm \\
-            --network container:buba_staging_db \\
+            --network container:${DB_CONTAINER} \\
+            -e "CONNECTIONSTRINGS__DATABASE=\$CONN" \\
             --entrypoint /app/efbundle/efbundle \\
             ${IMAGE_URI} \\
             --connection "\$CONN"
