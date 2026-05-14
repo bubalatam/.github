@@ -59,7 +59,7 @@ on:
         description: "Postgres connection string template for the bundle. Must contain `{password}` — replaced at runtime with the value of `migration-db-password-secret`. Host is always `localhost` because the migration runner is in the db container's network namespace."
         required: false
         type: string
-        default: "Host=localhost;Port=5432;Database=buba_cms_staging;Username=buba_admin;Password={password}"
+        default: "Host=localhost;Port=5432;Database=Buba_CMS_Staging;Username=buba_admin;Password={password}"
       aws-region:
         required: false
         type: string
