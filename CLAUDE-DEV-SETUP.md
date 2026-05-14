@@ -19,7 +19,7 @@ tenga las herramientas correctas. La regla de oro:
 | `mobile` (app) | _pendiente_: `mobile-app-developer`, `frontend-developer`, `ui-ux-designer`, `typescript-pro` | `frontend-design`, `ui-ux-pro-max` | App móvil con componentes UI compartidos con web. |
 | `infra` (IaC + AWS) | `devops-engineer` | `cloud-architect`, `cloud-devops`, `github-actions-creator`, `cso` | Terraform / docker compose staging / IAM policies / SSM. CSO opcional para auditorías de seguridad. |
 | `Buba` (legacy monorepo) | Igual que `api` (33 agents — full-stack) | Igual que `api` | Repo del que se extrajeron `api` y `web`. Mismo set por compatibilidad histórica. |
-| `docs` | _pendiente_: `business-analyst`, `product-strategist` | `frontend-design` (sitio MkDocs/Astro) | Sitio público de docs. |
+| `docs` (Obsidian vault) | _opcional_: `business-analyst`, `product-strategist`, `search-specialist` | _opcional_: `frontend-design` solo si se publica un sitio | Knowledge base interno (NO un sitio): brand/voz, vocabulario del dominio (construcción MX), stakeholders, runbooks técnicos. Vault de Obsidian (`.obsidian/`). Audiencia: PMs, diseño, sales, eng. Editar con Obsidian directo; las skills no son críticas. |
 
 > Los agents listados como _pendiente_ no están commiteados todavía — agrégalos
 > a `.claude/agents/` en cada repo cuando los necesites (los archivos viven en
