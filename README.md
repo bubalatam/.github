@@ -70,6 +70,11 @@ jobs:
 **Pinning:** callers reference `@main`. Once stable, tag releases (`v1`, `v1.1`)
 and pin callers to a tag.
 
+## Claude Code
+
+Setup recomendado por repo (qué skills instalar, qué agents versionar):
+[`CLAUDE-DEV-SETUP.md`](./CLAUDE-DEV-SETUP.md).
+
 ## Related
 
 - AWS IAM policies (trust + permissions): [`bubalatam/infra`](https://github.com/bubalatam/infra/tree/main/aws/iam-policies)
