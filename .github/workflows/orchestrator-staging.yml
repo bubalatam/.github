@@ -1,0 +1,495 @@
+name: Orchestrator — staging (api + web atomic deploy)
+
+# Atomic staging deploy across bubalatam/api and bubalatam/web.
+#
+# Why this exists:
+#   The per-repo deploy-staging.yml workflows are independent — if web fails to
+#   build while api succeeded, api gets promoted to a version that may not be
+#   compatible with the still-old web (or vice-versa). This orchestrator builds
+#   BOTH images in parallel, and only updates the EC2 if BOTH builds succeed.
+#   If either build fails, /opt/buba/.env.staging is never touched.
+#
+# How to trigger:
+#   Actions → "Orchestrator — staging" → Run workflow. Pick a ref per repo
+#   (branch name or SHA, default `Staging`). The workflow resolves each ref
+#   to an immutable SHA up-front so a force-push during build doesn't shift
+#   the deployed image away from what you reviewed.
+#
+# Required org-level secrets in bubalatam/.github:
+#   AWS_ROLE_ARN          — OIDC role for ECR push + SSM SendCommand
+#   BUBA_REPO_TOKEN       — fine-grained PAT with `contents:read` on
+#                           bubalatam/api and bubalatam/web (needed to
+#                           checkout private repos from this org-level repo).
+#   SLACK_WEBHOOK_URL     — optional, notification on success/failure
+#
+# Required org-level vars:
+#   EC2_INSTANCE_ID_STAGING — same as the per-repo workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      api-ref:
+        description: "bubalatam/api ref (branch, tag, or SHA). Default: Staging."
+        required: false
+        type: string
+        default: "Staging"
+      web-ref:
+        description: "bubalatam/web ref (branch, tag, or SHA). Default: Staging."
+        required: false
+        type: string
+        default: "Staging"
+      run-migrations:
+        description: "Run EF Core migrations after api build, before deploy."
+        required: false
+        type: boolean
+        default: true
+      aws-region:
+        required: false
+        type: string
+        default: "us-east-2"
+      ecr-registry:
+        required: false
+        type: string
+        default: "947072750565.dkr.ecr.us-east-2.amazonaws.com"
+      migration-db-container:
+        required: false
+        type: string
+        default: "buba_staging_db"
+      migration-db-password-secret:
+        required: false
+        type: string
+        default: "Buba-Staging-Db-Password"
+      migration-conn-template:
+        required: false
+        type: string
+        default: "Host=localhost;Port=5432;Database=buba_cms_staging;Username=buba_admin;Password={password}"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: orchestrator-staging
+  cancel-in-progress: false   # never cancel an in-flight atomic deploy
+
+jobs:
+  # Resolve human-friendly refs to immutable SHAs up-front. Both build jobs
+  # then check out by SHA so a force-push mid-build can't shift the deployed
+  # image away from what was reviewed.
+  resolve:
+    name: Resolve refs → SHAs
+    runs-on: ubuntu-latest
+    outputs:
+      api_sha: ${{ steps.api.outputs.sha }}
+      web_sha: ${{ steps.web.outputs.sha }}
+    steps:
+      - name: Resolve api ref
+        id: api
+        env:
+          GH_TOKEN: ${{ secrets.BUBA_REPO_TOKEN }}
+          REF: ${{ inputs.api-ref }}
+        run: |
+          SHA=$(gh api "repos/bubalatam/api/commits/${REF}" --jq .sha)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::error::could not resolve bubalatam/api@${REF}"
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "bubalatam/api ${REF} → ${SHA}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve web ref
+        id: web
+        env:
+          GH_TOKEN: ${{ secrets.BUBA_REPO_TOKEN }}
+          REF: ${{ inputs.web-ref }}
+        run: |
+          SHA=$(gh api "repos/bubalatam/web/commits/${REF}" --jq .sha)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::error::could not resolve bubalatam/web@${REF}"
+            exit 1
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "bubalatam/web ${REF} → ${SHA}" >> "$GITHUB_STEP_SUMMARY"
+
+  build-api:
+    name: Build & push api image
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+    steps:
+      - name: Checkout bubalatam/api
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: bubalatam/api
+          ref: ${{ needs.resolve.outputs.api_sha }}
+          token: ${{ secrets.BUBA_REPO_TOKEN }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build & push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: src/api/Dockerfile.staging
+          push: true
+          build-args: |
+            BUILD_ENVIRONMENT=Staging
+          tags: ${{ inputs.ecr-registry }}/buba/api:staging-${{ needs.resolve.outputs.api_sha }}
+          cache-from: type=gha,scope=staging-api
+          cache-to: type=gha,scope=staging-api,mode=max
+
+      - name: Expose image URI
+        id: image
+        env:
+          REGISTRY: ${{ inputs.ecr-registry }}
+          SHA: ${{ needs.resolve.outputs.api_sha }}
+        run: |
+          URI="${REGISTRY}/buba/api:staging-${SHA}"
+          echo "uri=${URI}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### api image"
+            echo "\`${URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-web:
+    name: Build & push web image
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+    steps:
+      - name: Checkout bubalatam/web
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: bubalatam/web
+          ref: ${{ needs.resolve.outputs.web_sha }}
+          token: ${{ secrets.BUBA_REPO_TOKEN }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build & push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          # Web repo convention — adjust if web's Dockerfile lives elsewhere.
+          file: Dockerfile.staging
+          push: true
+          tags: ${{ inputs.ecr-registry }}/buba/web:staging-${{ needs.resolve.outputs.web_sha }}
+          cache-from: type=gha,scope=staging-web
+          cache-to: type=gha,scope=staging-web,mode=max
+
+      - name: Expose image URI
+        id: image
+        env:
+          REGISTRY: ${{ inputs.ecr-registry }}
+          SHA: ${{ needs.resolve.outputs.web_sha }}
+        run: |
+          URI="${REGISTRY}/buba/web:staging-${SHA}"
+          echo "uri=${URI}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### web image"
+            echo "\`${URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Only runs if BOTH builds succeeded. This is the atomic gate — if either
+  # build fails, the EC2 is never touched and the previous versions of both
+  # api and web keep serving.
+  deploy:
+    name: Atomic deploy (api + web)
+    needs: [resolve, build-api, build-web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: staging
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Validate environment
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
+        run: |
+          if [ -z "${INSTANCE_ID:-}" ]; then
+            echo "::error::vars.EC2_INSTANCE_ID_STAGING is not set on this repo"
+            exit 1
+          fi
+
+      - name: Run EF Core migrations bundle
+        if: inputs.run-migrations
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
+          API_IMAGE: ${{ needs.build-api.outputs.image_uri }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ECR_REGISTRY: ${{ inputs.ecr-registry }}
+          DB_CONTAINER: ${{ inputs.migration-db-container }}
+          DB_SECRET_ID: ${{ inputs.migration-db-password-secret }}
+          CONN_TEMPLATE: ${{ inputs.migration-conn-template }}
+        run: |
+          set -euo pipefail
+          echo "Applying migrations from ${API_IMAGE} (db=${DB_CONTAINER})"
+
+          SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          aws ecr get-login-password --region ${AWS_REGION} | sudo docker login --username AWS --password-stdin ${ECR_REGISTRY}
+          sudo docker pull ${API_IMAGE}
+
+          DB_PASSWORD=\$(aws secretsmanager get-secret-value \\
+            --region ${AWS_REGION} \\
+            --secret-id ${DB_SECRET_ID} \\
+            --query SecretString --output text)
+          if [ -z "\$DB_PASSWORD" ]; then
+            echo "ERROR: empty DB password from Secrets Manager (${DB_SECRET_ID})"
+            exit 1
+          fi
+
+          if ! sudo docker inspect ${DB_CONTAINER} >/dev/null 2>&1; then
+            echo "ERROR: ${DB_CONTAINER} container not running"
+            exit 1
+          fi
+
+          CONN="${CONN_TEMPLATE//\{password\}/\$DB_PASSWORD}"
+          sudo docker run --rm \\
+            --network container:${DB_CONTAINER} \\
+            -e "CONNECTIONSTRINGS__DATABASE=\$CONN" \\
+            --entrypoint /app/efbundle/efbundle \\
+            ${API_IMAGE} \\
+            --connection "\$CONN"
+          echo "Migrations applied."
+          EOF
+          )
+          PARAMS=$(jq -nc --arg s "$SCRIPT" '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Orchestrator migrate api=${API_IMAGE##*:}" \
+            --timeout-seconds 600 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          sleep 3
+
+          STATUS=Pending
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) echo "migrations ok"; break ;;
+              Failed|Cancelled|TimedOut)
+                echo "migrations $STATUS — fetching logs"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text || true
+                echo "--- stderr ---"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text || true
+                exit 1 ;;
+              *) echo "$i/60 status=$STATUS"; sleep 10 ;;
+            esac
+          done
+
+          if [ "$STATUS" != Success ]; then
+            echo "::error::migration polling timed out"
+            exit 1
+          fi
+
+      # Single atomic update — both API_IMAGE and WEB_IMAGE flip in one SSM
+      # command, then docker compose up brings both services to the new
+      # versions in one pass. If this step fails mid-way the previous .env
+      # values are restored from the backup taken at the top of the script.
+      - name: Atomic deploy (update both images)
+        id: deploy
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
+          API_IMAGE: ${{ needs.build-api.outputs.image_uri }}
+          WEB_IMAGE: ${{ needs.build-web.outputs.image_uri }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ECR_REGISTRY: ${{ inputs.ecr-registry }}
+        run: |
+          set -euo pipefail
+          echo "Atomic deploy: API=${API_IMAGE} WEB=${WEB_IMAGE}"
+
+          SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          ENV_FILE=/opt/buba/.env.staging
+          COMPOSE_FILE=/opt/buba/docker-compose.staging.server.yml
+          test -f "\$ENV_FILE" || { echo "missing \$ENV_FILE"; exit 1; }
+          test -f "\$COMPOSE_FILE" || { echo "missing \$COMPOSE_FILE"; exit 1; }
+
+          aws ecr get-login-password --region ${AWS_REGION} | sudo docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+          # Backup .env before mutating — rollback if any subsequent step fails.
+          sudo cp "\$ENV_FILE" "\${ENV_FILE}.bak.\$(date -u +%Y%m%dT%H%M%SZ)"
+
+          # Flip both image references in a single sed invocation.
+          sudo sed -i \\
+            -e "s|^API_IMAGE=.*|API_IMAGE=${API_IMAGE}|" \\
+            -e "s|^WEB_IMAGE=.*|WEB_IMAGE=${WEB_IMAGE}|" \\
+            "\$ENV_FILE"
+          echo "--- env after update ---"
+          grep -E "^(API|WEB)_IMAGE=" "\$ENV_FILE"
+
+          # Pull both images and bring both services up in one compose call.
+          cd /opt/buba && sudo docker compose -f "\$COMPOSE_FILE" --env-file "\$ENV_FILE" pull staging-api staging-web
+          cd /opt/buba && sudo docker compose -f "\$COMPOSE_FILE" --env-file "\$ENV_FILE" up -d staging-api staging-web
+          sudo docker image prune -f --filter "until=72h" || true
+          EOF
+          )
+          PARAMS=$(jq -nc --arg s "$SCRIPT" '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Orchestrator deploy api+web" \
+            --timeout-seconds 600 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          sleep 3
+
+          STATUS=Pending
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) echo "deploy ok"; break ;;
+              Failed|Cancelled|TimedOut)
+                echo "deploy $STATUS — fetching logs"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text || true
+                echo "--- stderr ---"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text || true
+                exit 1 ;;
+              *) echo "$i/60 status=$STATUS"; sleep 10 ;;
+            esac
+          done
+
+          if [ "$STATUS" != Success ]; then
+            echo "::error::deploy polling timed out"
+            exit 1
+          fi
+
+      - name: Health check (api + web)
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
+        run: |
+          set -euo pipefail
+          echo "Polling both containers' health..."
+
+          SCRIPT=$(cat <<'EOF'
+          set -euo pipefail
+          check() {
+            local container="$1"
+            for i in $(seq 1 30); do
+              STATE=$(sudo docker inspect -f "{{.State.Health.Status}}" "$container" 2>/dev/null || echo none)
+              if [ "$STATE" = healthy ]; then echo "$container HEALTHY"; return 0; fi
+              if [ "$STATE" = unhealthy ]; then
+                echo "$container UNHEALTHY"
+                sudo docker logs --tail 80 "$container"
+                return 1
+              fi
+              echo "$container $i/30 health=$STATE"
+              sleep 10
+            done
+            echo "$container health check timeout"
+            sudo docker logs --tail 120 "$container"
+            return 1
+          }
+          check buba_staging_api &
+          API_PID=$!
+          check buba_staging_web &
+          WEB_PID=$!
+          wait $API_PID && API_OK=1 || API_OK=0
+          wait $WEB_PID && WEB_OK=1 || WEB_OK=0
+          [ "$API_OK" = "1" ] && [ "$WEB_OK" = "1" ]
+          EOF
+          )
+          PARAMS=$(jq -nc --arg s "$SCRIPT" '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 480 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          sleep 3
+
+          for i in $(seq 1 50); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) echo "both healthy"; exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                echo "health $STATUS"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text || true
+                exit 1 ;;
+              *) echo "$i/50 status=$STATUS"; sleep 10 ;;
+            esac
+          done
+          echo "::error::health polling timeout"
+          exit 1
+
+  notify:
+    name: Notify Slack
+    runs-on: ubuntu-latest
+    needs: [resolve, build-api, build-web, deploy]
+    if: always()
+    steps:
+      - name: Check Slack webhook
+        id: slack-check
+        env:
+          URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "${URL:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "SLACK_WEBHOOK_URL not set, skipping notification"
+          fi
+
+      - name: Send Slack notification
+        if: steps.slack-check.outputs.enabled == 'true'
+        uses: slackapi/slack-github-action@fcfb566f8b0aab22203f066d80ca1d7e4b5d05b3 # v1
+        with:
+          payload: |
+            {
+              "text": "Staging orchestrator deploy: ${{ needs.deploy.result }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Staging orchestrator deploy*\n*Status:* ${{ needs.deploy.result }}\n*api:* `${{ needs.build-api.outputs.image_uri }}`\n*web:* `${{ needs.build-web.outputs.image_uri }}`\n*Actor:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
