@@ -40,11 +40,6 @@ on:
         required: false
         type: string
         default: "947072750565.dkr.ecr.us-east-2.amazonaws.com"
-      secrets-manager-arn:
-        description: "Optional AWS Secrets Manager secret name or ARN. If set, the EC2 instance role fetches the JSON value, renders KEY=VALUE lines into /opt/buba/.env.staging.secrets (root:root 600), and compose loads it as a second --env-file. EC2 instance role must allow secretsmanager:GetSecretValue on this ARN."
-        required: false
-        type: string
-        default: ""
     secrets:
       AWS_ROLE_ARN:
         required: true
@@ -135,7 +130,6 @@ jobs:
           AWS_REGION: ${{ inputs.aws-region }}
           ECR_REGISTRY: ${{ inputs.ecr-registry }}
           SERVICE: ${{ inputs.service }}
-          SECRETS_ARN: ${{ inputs.secrets-manager-arn }}
           GH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -144,38 +138,23 @@ jobs:
           echo "Deploying ${IMAGE_URI} (${ENV_VAR}) to ${INSTANCE_ID}"
 
           # Build the remote shell script as a single string, then JSON-encode
-          # via jq. Cleaner than escaping double quotes inline. The
-          # ${SECRETS_ARN}-empty branch keeps the workflow backwards-compatible
-          # for callers that don't use Secrets Manager (e.g. web).
+          # via jq. Cleaner than escaping double quotes inline. Runtime secrets
+          # (Stripe / Mailgun / Jwt / etc.) are pulled by the app at startup
+          # from AWS Secrets Manager (`Buba-Staging-*`) via the SDK; no
+          # fetch-at-deploy step needed here.
           SCRIPT=$(cat <<EOF
           set -euo pipefail
           ENV_FILE=/opt/buba/.env.staging
-          ENV_SECRETS=/opt/buba/.env.staging.secrets
           COMPOSE_FILE=/opt/buba/docker-compose.staging.server.yml
-          SECRETS_ARN="${SECRETS_ARN}"
           test -f "\$ENV_FILE" || { echo "missing \$ENV_FILE"; exit 1; }
           test -f "\$COMPOSE_FILE" || { echo "missing \$COMPOSE_FILE"; exit 1; }
           aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
-          if [ -n "\$SECRETS_ARN" ]; then
-            command -v jq >/dev/null 2>&1 || { echo "jq required on EC2 host (sudo apt-get install -y jq)"; exit 1; }
-            TMP=\$(mktemp)
-            chmod 600 "\$TMP"
-            aws secretsmanager get-secret-value --secret-id "\$SECRETS_ARN" --region ${AWS_REGION} --query SecretString --output text \
-              | jq -r 'to_entries[] | "\(.key)=\(.value)"' > "\$TMP"
-            sudo chown root:root "\$TMP"
-            sudo mv "\$TMP" "\$ENV_SECRETS"
-            sudo chmod 600 "\$ENV_SECRETS"
-            echo "Fetched \$(wc -l < \$ENV_SECRETS) secrets from \$SECRETS_ARN"
-          fi
-
           sudo sed -i "s|^${ENV_VAR}=.*|${ENV_VAR}=${IMAGE_URI}|" "\$ENV_FILE"
           grep "^${ENV_VAR}=" "\$ENV_FILE"
 
-          EXTRA_ENV_ARGS=""
-          [ -f "\$ENV_SECRETS" ] && EXTRA_ENV_ARGS="--env-file \$ENV_SECRETS"
-          cd /opt/buba && sudo docker compose -f "\$COMPOSE_FILE" --env-file "\$ENV_FILE" \$EXTRA_ENV_ARGS pull ${COMPOSE_SERVICE}
-          cd /opt/buba && sudo docker compose -f "\$COMPOSE_FILE" --env-file "\$ENV_FILE" \$EXTRA_ENV_ARGS up -d ${COMPOSE_SERVICE}
+          cd /opt/buba && sudo docker compose -f "\$COMPOSE_FILE" --env-file "\$ENV_FILE" pull ${COMPOSE_SERVICE}
+          cd /opt/buba && sudo docker compose -f "\$COMPOSE_FILE" --env-file "\$ENV_FILE" up -d ${COMPOSE_SERVICE}
           sudo docker image prune -f --filter "until=72h" || true
           EOF
           )

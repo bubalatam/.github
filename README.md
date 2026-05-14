@@ -46,16 +46,15 @@ jobs:
       dockerfile: src/api/Dockerfile.staging
       build-args: |
         BUILD_ENVIRONMENT=Staging
-      # Optional: AWS Secrets Manager secret with runtime app secrets.
-      # If set, fetched on every deploy and rendered as
-      # /opt/buba/.env.staging.secrets (root:root 600), then loaded
-      # by compose via --env-file. JSON keys must match the .NET
-      # config keys verbatim (e.g. `Stripe__SecretKey`).
-      secrets-manager-arn: buba/staging/api
     secrets:
       AWS_ROLE_ARN:      ${{ secrets.AWS_ROLE_ARN }}
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}   # optional
 ```
+
+> Runtime secrets (Stripe / Mailgun / Jwt / etc.) are read by the .NET app at
+> startup from AWS Secrets Manager (`Buba-Staging-*`) via the SDK — this
+> workflow does NOT inject them. The staging EC2 instance role must allow
+> `secretsmanager:GetSecretValue` on `Buba-Staging-*`.
 
 **Required repo-level config (in the caller repo, Settings → Secrets and variables → Actions):**
 
