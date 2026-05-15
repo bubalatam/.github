@@ -312,6 +312,8 @@ jobs:
           fi
 
       - name: Health check
+        # TODO: verify that the running container's image SHA matches the deployed
+        # image URI — currently only confirms liveness, not that the new image is active.
         env:
           INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_STAGING }}
           SERVICE: ${{ inputs.service }}
