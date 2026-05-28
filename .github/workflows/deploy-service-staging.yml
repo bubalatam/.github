@@ -197,6 +197,7 @@ jobs:
           sudo docker run --rm \\
             --network container:${DB_CONTAINER} \\
             -e "CONNECTIONSTRINGS__DATABASE=\$CONN" \\
+            -e "ASPNETCORE_ENVIRONMENT=Development" \\
             --entrypoint /app/efbundle/efbundle \\
             ${IMAGE_URI} \\
             --connection "\$CONN"
