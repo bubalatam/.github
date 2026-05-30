@@ -1,0 +1,298 @@
+name: Deploy service to production (reusable)
+
+# Reusable workflow called by bubalatam/web on push to main.
+# Builds the service image, pushes to ECR with an immutable
+# `production-<sha>` tag, then SSM RunCommand on the production EC2 to update
+# /opt/buba/.env.production and `docker compose up -d` the service.
+#
+# Caller required permissions: id-token: write, contents: read.
+# Caller required secrets:     AWS_ROLE_ARN.
+# Caller required vars:        EC2_INSTANCE_ID_PRODUCTION. Optional: DEPLOY_BUCKET.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service short name (web). Drives ECR repo, compose service, container name."
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to the Dockerfile in the caller's repo."
+        required: true
+        type: string
+      build-context:
+        description: "Docker build context (defaults to caller repo root)."
+        required: false
+        type: string
+        default: "."
+      build-args:
+        description: "Newline-separated --build-arg KEY=VALUE pairs."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        required: false
+        type: string
+        default: "us-east-2"
+      ecr-registry:
+        required: false
+        type: string
+        default: "947072750565.dkr.ecr.us-east-2.amazonaws.com"
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
+
+concurrency:
+  group: deploy-production-${{ inputs.service }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build & push ${{ inputs.service }} image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+    steps:
+      - name: Checkout caller
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build & push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: ${{ inputs.build-args }}
+          tags: ${{ inputs.ecr-registry }}/buba/${{ inputs.service }}:production-${{ github.sha }}
+          cache-from: type=gha,scope=production-${{ inputs.service }}
+          cache-to: type=gha,scope=production-${{ inputs.service }},mode=max
+
+      - name: Expose image URI
+        id: image
+        env:
+          REGISTRY: ${{ inputs.ecr-registry }}
+          SERVICE: ${{ inputs.service }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          URI="${REGISTRY}/buba/${SERVICE}:production-${GIT_SHA}"
+          echo "uri=${URI}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${SERVICE} image"
+            echo "\`${URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy ${{ inputs.service }} via SSM
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Validate environment
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_PRODUCTION }}
+        run: |
+          if [ -z "${INSTANCE_ID:-}" ]; then
+            echo "::error::vars.EC2_INSTANCE_ID_PRODUCTION is not set on the caller repo"
+            exit 1
+          fi
+
+      - name: Update .env.production and redeploy
+        id: deploy
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_PRODUCTION }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ECR_REGISTRY: ${{ inputs.ecr-registry }}
+          SERVICE: ${{ inputs.service }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ENV_VAR=$(printf '%s_IMAGE' "$SERVICE" | tr '[:lower:]' '[:upper:]')   # WEB_IMAGE
+          COMPOSE_SERVICE="prod-${SERVICE}"
+          COMPOSE_FILE="/opt/buba/docker-compose.production.server.yml"
+          ENV_FILE="/opt/buba/.env.production"
+
+          SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          test -f "${ENV_FILE}" || { echo "missing ${ENV_FILE}"; exit 1; }
+          test -f "${COMPOSE_FILE}" || { echo "missing ${COMPOSE_FILE}"; exit 1; }
+          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+          sudo sed -i "s|^${ENV_VAR}=.*|${ENV_VAR}=${IMAGE_URI}|" "${ENV_FILE}"
+          if ! grep -q "^${ENV_VAR}=" "${ENV_FILE}"; then
+            echo "${ENV_VAR}=${IMAGE_URI}" >> "${ENV_FILE}"
+          fi
+          grep "^${ENV_VAR}=" "${ENV_FILE}"
+
+          cd /opt/buba
+          sudo docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" pull ${COMPOSE_SERVICE}
+          sudo docker compose -f "${COMPOSE_FILE}" --env-file "${ENV_FILE}" up -d ${COMPOSE_SERVICE}
+          sudo docker image prune -f --filter "until=72h" || true
+          EOF
+          )
+          PARAMS=$(jq -nc --arg s "$SCRIPT" '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${SERVICE} ${GIT_SHA:0:12}" \
+            --timeout-seconds 600 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=${CMD_ID}" >> "$GITHUB_OUTPUT"
+          sleep 3
+
+          STATUS=Pending
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) echo "deploy ok"; break ;;
+              Failed|Cancelled|TimedOut)
+                echo "deploy $STATUS"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text || true
+                echo "--- stderr ---"
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' --output text || true
+                exit 1 ;;
+              *) echo "$i/60 status=$STATUS"; sleep 10 ;;
+            esac
+          done
+
+          if [ "$STATUS" != Success ]; then
+            echo "::error::deploy polling timed out"
+            exit 1
+          fi
+
+      - name: Health check
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID_PRODUCTION }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          CONTAINER="buba_prod_${SERVICE}"
+
+          SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          for i in \$(seq 1 30); do
+            STATE=\$(sudo docker inspect -f "{{.State.Health.Status}}" ${CONTAINER} 2>/dev/null || echo none)
+            if [ "\$STATE" = healthy ]; then echo HEALTHY; exit 0; fi
+            if [ "\$STATE" = unhealthy ]; then echo UNHEALTHY; sudo docker logs --tail 80 ${CONTAINER}; exit 1; fi
+            echo "\$i/30 health=\$STATE"; sleep 10
+          done
+          echo "health check timeout"; sudo docker logs --tail 120 ${CONTAINER}; exit 1
+          EOF
+          )
+          PARAMS=$(jq -nc --arg s "$SCRIPT" '{commands: [$s]}')
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --timeout-seconds 360 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          sleep 3
+
+          for i in $(seq 1 40); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) echo "health ok"; exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' --output text || true
+                exit 1 ;;
+              *) echo "$i/40 status=$STATUS"; sleep 10 ;;
+            esac
+          done
+          echo "::error::health polling timeout"
+          exit 1
+
+      - name: Record deployment
+        if: success()
+        env:
+          BUCKET_NAME: ${{ vars.DEPLOY_BUCKET }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          SERVICE: ${{ inputs.service }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_ACTOR: ${{ github.actor }}
+          GIT_REF: ${{ github.ref_name }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "${BUCKET_NAME:-}" ]; then echo "DEPLOY_BUCKET not set, skipping"; exit 0; fi
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          JSON=$(jq -nc \
+            --arg env "production" \
+            --arg service "$SERVICE" \
+            --arg sha "$GIT_SHA" \
+            --arg image "$IMAGE_URI" \
+            --arg ts "$TIMESTAMP" \
+            --arg actor "$GIT_ACTOR" \
+            --arg branch "$GIT_REF" \
+            --arg run "${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}" \
+            '{environment:$env,service:$service,sha:$sha,image:$image,timestamp:$ts,actor:$actor,branch:$branch,workflow_run:$run}')
+          echo "$JSON" | aws s3 cp - "s3://${BUCKET_NAME}/deploy-status/production-${SERVICE}.json"
+
+  notify:
+    name: Notify Slack
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy]
+    timeout-minutes: 5
+    if: always()
+    steps:
+      - name: Check Slack webhook
+        id: slack-check
+        env:
+          URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "${URL:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "SLACK_WEBHOOK_URL not set, skipping notification"
+          fi
+
+      - name: Send Slack notification
+        if: steps.slack-check.outputs.enabled == 'true'
+        uses: slackapi/slack-github-action@fcfb566f8b0aab22203f066d80ca1d7e4b5d05b3 # v1
+        with:
+          payload: |
+            {
+              "text": "Production ${{ inputs.service }} deploy: ${{ needs.deploy.result }}",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Production ${{ inputs.service }} deploy*\n*Status:* ${{ needs.deploy.result }}\n*Image:* `${{ needs.build-and-push.outputs.image_uri }}`\n*Branch:* `${{ github.ref_name }}`\n*Actor:* ${{ github.actor }}"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
